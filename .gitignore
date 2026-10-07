@@ -1,0 +1,4 @@
+# Logged-in browser session (cookies) - never commit
+.browser-profile/
+__pycache__/
+*.pyc
