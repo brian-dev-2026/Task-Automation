@@ -113,7 +113,7 @@
         projectId: p.projectId, summary: details, priorityId: parseInt(m.priority) + 1,
         assigneeId: parseInt(user.backLogUserID), startDate: start, dueDate: finish, issueTypeId: p.issueTypeId,
       }))).data;
-      const res = await axios.post('api/addChildTask', {
+      const child = {
         reqCode: m.reqCode, systemID: m.systemID, priority: m.priority, requester: m.requester,
         contact_No: m.contact_No, req_Company: m.req_Company, req_Department: m.req_Department,
         req_Section: m.req_Section, minDate: m.targetToStart, maxDate: m.targetDate,
@@ -121,8 +121,24 @@
         isApproved: 1, status: 5, reqType: 5, reqKind: 6,
         issueID: issue.id, assignProgrammer: user.employeeID, updatedBy: user.employeeID,
         process: [{ statusID: 5, processID: 1, processName: 'Making of Request' }],
-      });
-      if (res.data !== 'OK') throw new Error(`addChildTask replied ${JSON.stringify(res.data)}`);
+      };
+      // The server sometimes answers 500. Before resending, check whether it saved anyway
+      // (the row carries this Backlog issue id), so a retry never creates a duplicate.
+      const savedAnyway = async () => (await ct.openChildren(m.reqCode, ['Not yet Started']))
+        .some(r => String(r.issueID_backLog) === String(issue.id));
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await axios.post('api/addChildTask', child);
+          if (res.data === 'OK') return;
+          lastError = new Error(`addChildTask replied ${JSON.stringify(res.data)}`);
+        } catch (e) { lastError = e; }
+        await sleep(3000 * attempt);
+        if (await savedAnyway().catch(() => false)) return;
+      }
+      // Not saved: close the Backlog issue we made so it isn't left Open with no task.
+      await backlog(() => axios.patch(`${BACKLOG}/issues/${issue.id}?apiKey=${p.key}`, { statusId: 4 })).catch(() => {});
+      throw lastError;
     },
 
     async start(r) {   // = putStartDate
