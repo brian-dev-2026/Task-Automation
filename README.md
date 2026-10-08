@@ -50,5 +50,9 @@ The script logs in with your Employee ID if needed. The session is kept in `.bro
 
 - **Saves run one at a time.** The server numbers a new child task as "highest code + 1", so parallel saves got duplicate codes.
 - The main task must be **On-going**; the site only allows starting child tasks then.
-- **Re-running a list:** unfinished tasks with the same text are continued instead of re-added. Finished tasks are not checked, so only re-run the tasks that failed.
+- **Re-running a list is safe:** unfinished tasks with the same text are continued, and finished ones are skipped, instead of being re-added.
+- **Stop:** while a run is going, the panel's button becomes **Stop**. It stops after the task in hand; run the same list again to continue.
+- **Editing during a run (panel):** tasks are taken from the top of the list one at a time and moved to a locked "Taken" list. Until a task is taken you can still edit it, delete it (e.g. cut 1000 down to 700) or add more at the end. Once saving is done, the list locks.
+- **Big batches:** over 100 tasks, you type the count to confirm.
+- If the page is reloaded mid-run, reopening the panel shows how far the last run got.
 - No credentials are stored in the code. The Backlog API key is read from the site's own script at run time.

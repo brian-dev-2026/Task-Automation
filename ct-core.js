@@ -169,10 +169,19 @@
     },
 
     // Add, start and finish every task. log(msg) reports progress.
-    // Returns [{details, ok, error}] in the same order as `tasks`.
-    async runBatch(code, tasks, start, finish, log) {
-      const n = tasks.length, tag = i => `[${i + 1}/${n}]`;
-      const results = tasks.map(details => ({ details, ok: false, error: null }));
+    // `tasks` is an array, or a (possibly async) function returning the next task (null when there are no more)
+    // so the panel can keep the not-yet-saved part of the list editable during the run;
+    // then pending() tells how many are still waiting, for the [i/n] counter.
+    // shouldStop() is checked before each task: true stops after the task in hand.
+    // progress(i, 'saved' | 'finished') is called as each task gets there;
+    // savingDone() once no more tasks will be taken.
+    // Returns [{details, ok, skipped, error}] in the order the tasks were taken.
+    async runBatch(code, tasks, start, finish, log,
+                   { shouldStop = () => false, progress = () => {}, pending = () => 0, savingDone = () => {} } = {}) {
+      let next = tasks;
+      if (Array.isArray(tasks)) { let k = 0; next = () => (k < tasks.length ? tasks[k++] : null); pending = () => tasks.length - k; }
+      const results = [], taken = [];   // taken[i] = details of the i-th task taken
+      const tag = i => `[${i + 1}/${results.length + pending()}]`;
       const rows = [], claimed = new Set();
       const fail = (i, e) => { results[i].error = errText(e); log(`${tag(i)} FAILED: ${results[i].error}`); };
       // An unfinished child with these details that no other task has taken.
@@ -186,19 +195,31 @@
       log('Checking for tasks already added...');
       const p = await ct.prepare(code);
       open = await ct.openChildren(code, ['Not yet Started', 'On-going']);
+      // Finished children, counted by text, so re-running a list never re-adds them
+      // (seen 2026-10-08: a re-run re-added 19 finished tasks as new ones).
+      const done = new Map();
+      (await ct.openChildren(code, ['Finished'])).forEach(r => done.set(norm(r.details), (done.get(norm(r.details)) || 0) + 1));
 
       // 1. Save the tasks that aren't there yet (an earlier, interrupted run may have saved some).
-      const toAdd = [];
-      tasks.forEach((d, i) => {
+      //    One at a time, taking each task only when it is its turn (see CONCURRENCY).
+      let saved = [], stopped = false;
+      const stopNow = () => stopped || (stopped = shouldStop());
+      for (let d; !stopNow() && (d = await next()) != null;) {
+        const i = results.length;
+        taken.push(d); results.push({ details: d, ok: false, error: null });
         rows[i] = claim(d);
-        if (rows[i]) log(`${tag(i)} already added as ${rows[i].reqCode} - continuing it`);
-        else toAdd.push(i);
-      });
-      let saved = [];
-      await pool(toAdd, async i => {
-        try { await ct.add(p, tasks[i], start, finish); saved.push(i); log(`${tag(i)} saved`); }
+        if (rows[i]) { log(`${tag(i)} already added as ${rows[i].reqCode} - continuing it`); continue; }
+        const left = done.get(norm(d)) || 0;
+        if (left) {
+          done.set(norm(d), left - 1);
+          results[i].ok = true; results[i].skipped = true;
+          log(`${tag(i)} already finished - skipped`);
+          continue;
+        }
+        try { await ct.add(p, d, start, finish); saved.push(i); log(`${tag(i)} saved`); progress(i, 'saved'); }
         catch (e) { fail(i, e); }
-      });
+      }
+      savingDone();   // no more tasks will be taken from here on
 
       // 2. Look up the new rows - new tasks are "Not yet Started", the fastest query
       //    (retry a few times if the server is slow to list them).
@@ -206,20 +227,25 @@
         if (attempt) await sleep(3000);
         log('Getting the new child tasks...');
         open = await ct.openChildren(code, ['Not yet Started']);
-        saved = saved.filter(i => !(rows[i] = claim(tasks[i])));
+        saved = saved.filter(i => !(rows[i] = claim(taken[i])));
       }
       saved.forEach(i => fail(i, new Error('saved, but it did not appear in the task list')));
 
       // 3. Start and finish.
-      await pool(tasks.map((_, i) => i).filter(i => rows[i]), async i => {
+      await pool(taken.map((_, i) => i).filter(i => rows[i]), async i => {
         const r = rows[i];
+        if (stopNow()) { results[i].error = 'stopped'; return; }
         try {
           if (r.startDate == null) await ct.start(r);
           await ct.finish(p, r);
           results[i].ok = true;
-          log(`${tag(i)} finished (${r.reqCode})`);
+          log(`${tag(i)} finished (${r.reqCode})`); progress(i, 'finished');
         } catch (e) { fail(i, e); }
       });
+      if (stopped) {
+        const notDone = results.filter(r => r.error === 'stopped').length;
+        log(`Stopped. ${notDone} task(s) not done - run the same list again to continue (finished ones are skipped).`);
+      }
       return results;
     },
   };

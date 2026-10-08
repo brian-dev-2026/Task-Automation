@@ -183,12 +183,13 @@ def run(tasks, show=False):
                 [main_code, tasks, start.isoformat(), finish.isoformat()],
             )
             failed = [r["details"] for r in results if not r["ok"]]
+            skipped = sum(1 for r in results if r.get("skipped"))
         except Exception as e:  # could not load the list / system info
             print(f"FAILED: {clean_error(e)}")
-            failed = tasks
+            failed, skipped = tasks, 0
 
-        print(f"\nDone: {len(tasks) - len(failed)}/{len(tasks)} child tasks added and finished "
-              f"in {time.time() - t0:.0f}s.")
+        print(f"\nDone: {len(tasks) - len(failed)}/{len(tasks)} child tasks finished "
+              f"in {time.time() - t0:.0f}s" + (f" ({skipped} were already finished)" if skipped else "") + ".")
         if failed:
             print("Not completed (run again with just these to retry - saved ones are continued, not re-added):")
             for i, d in enumerate(failed, 1):
@@ -200,7 +201,8 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry_run = "--dry-run" in sys.argv
 
-    text = Path(args[0]).read_text(encoding="utf-8") if args else read_pasted_tasks()
+    # utf-8-sig: files saved by Notepad/PowerShell often start with a BOM, which would hide the first "1."
+    text = Path(args[0]).read_text(encoding="utf-8-sig") if args else read_pasted_tasks()
     tasks = parse_tasks(text)
     if not tasks:
         sys.exit("No tasks found.")
@@ -216,7 +218,10 @@ def main():
         sys.exit("\nShorten the tasks marked TOO LONG and run again.")
     if dry_run:
         return
-    if input("\nAdd, start and finish all of these? (y/n): ").strip().lower() != "y":
+    if len(tasks) > 100:
+        if input(f"\nThat is {len(tasks)} tasks. Type {len(tasks)} to confirm: ").strip() != str(len(tasks)):
+            sys.exit("Cancelled.")
+    elif input("\nAdd, start and finish all of these? (y/n): ").strip().lower() != "y":
         sys.exit("Cancelled.")
     run(tasks, show="--show" in sys.argv)
 
