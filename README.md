@@ -49,9 +49,12 @@ The script logs in with your Employee ID if needed. The session is kept in `.bro
 ## Rules
 
 - **Saves run one at a time.** The server numbers a new child task as "highest code + 1", so parallel saves got duplicate codes.
+  The next task's Backlog issue is made while the current one saves, and start/finish runs 3 at a time.
+  The log ends with timings per phase and per request, to see where a slow run spent its time.
 - The main task must be **On-going**; the site only allows starting child tasks then.
+- **Start/finish failures are retried:** the database sometimes refuses a connection for a moment. Up to 3 rounds, 10s apart, re-read each failed task first and do only the step still missing, so nothing is started or finished twice.
 - **Re-running a list is safe:** unfinished tasks with the same text are continued, and finished ones are skipped, instead of being re-added.
-- **Stop:** while a run is going, the panel's button becomes **Stop**. It stops after the task in hand; run the same list again to continue.
+- **Stop:** while a run is going, the panel's button becomes **Stop**. It stops after the tasks in hand (up to two); run the same list again to continue.
 - **Editing during a run (panel):** tasks are taken from the top of the list one at a time and moved to a locked "Taken" list. Until a task is taken you can still edit it, delete it (e.g. cut 1000 down to 700) or add more at the end. Once saving is done, the list locks.
 - **Big batches:** over 100 tasks, you type the count to confirm.
 - If the page is reloaded mid-run, reopening the panel shows how far the last run got.

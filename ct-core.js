@@ -8,6 +8,10 @@
   // One at a time: the server numbers a new child task as "highest code + 1", so
   // parallel saves get the SAME code (seen 2026-10-07: 504-740 and 504-744 x3).
   const CONCURRENCY = 1;
+  // Start and finish only touch rows that already have their own code, so these can overlap
+  // (tested 2026-10-09: 6 tasks took 36s one at a time, 13s three at a time).
+  const FINISH_CONCURRENCY = 3;
+  const FINISH_RETRIES = 3;   // rounds of retrying start/finish failures, 10s apart
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const pad = n => String(n).padStart(2, '0');
@@ -33,10 +37,19 @@
       }
     }
   };
-  const pool = async (items, fn) => {   // run fn over items, CONCURRENCY at a time
+  const pool = async (items, fn, n = CONCURRENCY) => {   // run fn over items, n at a time
     let next = 0;
     const worker = async () => { while (next < items.length) await fn(items[next++]); };
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, items.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  };
+  // How long each kind of request takes, summed per run: {name: [count, total ms]}.
+  let times = {};
+  const timed = async (name, fn) => {
+    const t = performance.now();
+    try { return await fn(); } finally {
+      const s = times[name] = times[name] || [0, 0];
+      s[0]++; s[1] += performance.now() - t;
+    }
   };
   const errText = e => e.response ? `HTTP ${e.response.status}: ${JSON.stringify(e.response.data).slice(0, 300)}` : String(e.message || e);
 
@@ -107,12 +120,18 @@
       return { user, main, projectId, key, issueTypeId: types.find(t => t.name == 'Task').id };
     },
 
-    async add(p, details, start, finish) {   // = saveChildTask
+    async createIssue(p, details, start, finish) {   // the Backlog half of saveChildTask
       const { user, main: m } = p;
-      const issue = (await backlog(() => axios.post(`${BACKLOG}/issues?apiKey=${p.key}`, {
+      return (await timed('Backlog create', () => backlog(() => axios.post(`${BACKLOG}/issues?apiKey=${p.key}`, {
         projectId: p.projectId, summary: details, priorityId: parseInt(m.priority) + 1,
         assigneeId: parseInt(user.backLogUserID), startDate: start, dueDate: finish, issueTypeId: p.issueTypeId,
-      }))).data;
+      })))).data;
+    },
+
+    // = saveChildTask. `issue` is its Backlog issue if already made (see runBatch).
+    async add(p, details, start, finish, issue) {
+      const { user, main: m } = p;
+      issue = issue || await ct.createIssue(p, details, start, finish);
       const child = {
         reqCode: m.reqCode, systemID: m.systemID, priority: m.priority, requester: m.requester,
         contact_No: m.contact_No, req_Company: m.req_Company, req_Department: m.req_Department,
@@ -129,12 +148,12 @@
       let lastError;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          const res = await axios.post('api/addChildTask', child);
+          const res = await timed('addChildTask', () => axios.post('api/addChildTask', child));
           if (res.data === 'OK') return;
           lastError = new Error(`addChildTask replied ${JSON.stringify(res.data)}`);
         } catch (e) { lastError = e; }
-        await sleep(3000 * attempt);
-        if (await savedAnyway().catch(() => false)) return;
+        await timed('500 retry wait', () => sleep(3000 * attempt));
+        if (await timed('500 saved-anyway check', savedAnyway).catch(() => false)) return;
       }
       // Not saved: close the Backlog issue we made so it isn't left Open with no task.
       await backlog(() => axios.patch(`${BACKLOG}/issues/${issue.id}?apiKey=${p.key}`, { statusId: 4 })).catch(() => {});
@@ -144,8 +163,13 @@
     async start(r) {   // = putStartDate
       r.startDate = now();
       if (r.iirID !== null) axios.get(`http://10.169.141.123:6055/udpateIIRData/${r.iirID}/On-going`).catch(() => {});
-      await axios.post('api/addStartDate', r);
+      await timed('addStartDate', () => axios.post('api/addStartDate', r));
       r.statusName = 'On-going'; r.status = '1';
+    },
+
+    async closeIssue(p, r) {   // Backlog issue -> Closed (closing it twice is harmless)
+      await timed('Backlog close', () => backlog(() => axios.patch(`${BACKLOG}/issues/${parseInt(r.issueID_backLog)}?apiKey=${p.key}`, { statusId: 4 })))
+        .catch(e => console.warn('Backlog close failed', e));
     },
 
     async finish(p, r) {   // = putEndDate (child task path)
@@ -161,9 +185,8 @@
         if (!open.length) throw new Error('no open process step to finish');
         r.processID = parseInt(open[0].processID);
         r.statusID = open[0].statusID;
-        await axios.post('api/addEndDate', r);
-        await backlog(() => axios.patch(`${BACKLOG}/issues/${parseInt(r.issueID_backLog)}?apiKey=${p.key}`, { statusId: 4 }))
-          .catch(e => console.warn('Backlog close failed', e));
+        await timed('addEndDate', () => axios.post('api/addEndDate', r));
+        await ct.closeIssue(p, r);
       }
       r.statusName = 'Finished'; r.status = 4;
     },
@@ -177,7 +200,11 @@
     // savingDone() once no more tasks will be taken.
     // Returns [{details, ok, skipped, error}] in the order the tasks were taken.
     async runBatch(code, tasks, start, finish, log,
-                   { shouldStop = () => false, progress = () => {}, pending = () => 0, savingDone = () => {} } = {}) {
+                   { shouldStop = () => false, progress = () => {}, pending = () => 0, savingDone = () => {},
+                     finishConcurrency = FINISH_CONCURRENCY } = {}) {
+      times = {};
+      const phase = {}, mark = name => { phase[name] = performance.now(); };
+      mark('run');
       let next = tasks;
       if (Array.isArray(tasks)) { let k = 0; next = () => (k < tasks.length ? tasks[k++] : null); pending = () => tasks.length - k; }
       const results = [], taken = [];   // taken[i] = details of the i-th task taken
@@ -193,31 +220,50 @@
       };
 
       log('Checking for tasks already added...');
-      const p = await ct.prepare(code);
-      open = await ct.openChildren(code, ['Not yet Started', 'On-going']);
-      // Finished children, counted by text, so re-running a list never re-adds them
+      // All at once: each list query takes 5-10s.
+      // Finished children are counted by text, so re-running a list never re-adds them
       // (seen 2026-10-08: a re-run re-added 19 finished tasks as new ones).
+      const [p, openRows, finished] = await Promise.all([
+        timed('prepare', () => ct.prepare(code)),
+        timed('list query', () => ct.openChildren(code, ['Not yet Started', 'On-going'])),
+        timed('list query', () => ct.openChildren(code, ['Finished'])),
+      ]);
+      open = openRows;
       const done = new Map();
-      (await ct.openChildren(code, ['Finished'])).forEach(r => done.set(norm(r.details), (done.get(norm(r.details)) || 0) + 1));
+      finished.forEach(r => done.set(norm(r.details), (done.get(norm(r.details)) || 0) + 1));
 
       // 1. Save the tasks that aren't there yet (an earlier, interrupted run may have saved some).
-      //    One at a time, taking each task only when it is its turn (see CONCURRENCY).
+      //    Saves go one at a time (see CONCURRENCY), but the next task's Backlog issue is made
+      //    while the current one saves, since only addChildTask needs its turn.
+      //    So a task is taken one save early, and Stop stops after the (up to two) tasks in hand.
+      mark('save');
       let saved = [], stopped = false;
       const stopNow = () => stopped || (stopped = shouldStop());
-      for (let d; !stopNow() && (d = await next()) != null;) {
-        const i = results.length;
-        taken.push(d); results.push({ details: d, ok: false, error: null });
-        rows[i] = claim(d);
-        if (rows[i]) { log(`${tag(i)} already added as ${rows[i].reqCode} - continuing it`); continue; }
-        const left = done.get(norm(d)) || 0;
-        if (left) {
-          done.set(norm(d), left - 1);
-          results[i].ok = true; results[i].skipped = true;
-          log(`${tag(i)} already finished - skipped`);
-          continue;
+      // The next task that needs saving, with its Backlog issue under way; null when there are no more.
+      const takeNext = async () => {
+        for (let d; !stopNow() && (d = await next()) != null;) {
+          const i = results.length;
+          taken.push(d); results.push({ details: d, ok: false, error: null });
+          rows[i] = claim(d);
+          if (rows[i]) { log(`${tag(i)} already added as ${rows[i].reqCode} - continuing it`); continue; }
+          const left = done.get(norm(d)) || 0;
+          if (left) {
+            done.set(norm(d), left - 1);
+            results[i].ok = true; results[i].skipped = true;
+            log(`${tag(i)} already finished - skipped`);
+            continue;
+          }
+          const issue = ct.createIssue(p, d, start, finish);
+          issue.catch(() => {});   // a failure is reported when this task saves
+          return { i, d, issue };
         }
-        try { await ct.add(p, d, start, finish); saved.push(i); log(`${tag(i)} saved`); progress(i, 'saved'); }
-        catch (e) { fail(i, e); }
+        return null;
+      };
+      for (let cur = await takeNext(); cur;) {
+        const upcoming = takeNext();
+        try { await ct.add(p, cur.d, start, finish, await cur.issue); saved.push(cur.i); log(`${tag(cur.i)} saved`); progress(cur.i, 'saved'); }
+        catch (e) { fail(cur.i, e); }
+        cur = await upcoming;
       }
       savingDone();   // no more tasks will be taken from here on
 
@@ -226,12 +272,13 @@
       for (let attempt = 0; saved.length && attempt < 4; attempt++) {
         if (attempt) await sleep(3000);
         log('Getting the new child tasks...');
-        open = await ct.openChildren(code, ['Not yet Started']);
+        open = await timed('list query', () => ct.openChildren(code, ['Not yet Started']));
         saved = saved.filter(i => !(rows[i] = claim(taken[i])));
       }
       saved.forEach(i => fail(i, new Error('saved, but it did not appear in the task list')));
 
       // 3. Start and finish.
+      mark('finish');
       await pool(taken.map((_, i) => i).filter(i => rows[i]), async i => {
         const r = rows[i];
         if (stopNow()) { results[i].error = 'stopped'; return; }
@@ -241,7 +288,44 @@
           results[i].ok = true;
           log(`${tag(i)} finished (${r.reqCode})`); progress(i, 'finished');
         } catch (e) { fail(i, e); }
-      });
+      }, finishConcurrency);
+
+      // 4. Retry start/finish failures: the database sometimes refuses connections for a moment
+      //    (seen 2026-10-09: SQLSTATE[08001] on addEndDate). Each round re-reads the rows first,
+      //    so a step the server did take before the error is not done twice.
+      for (let round = 1; round <= FINISH_RETRIES; round++) {
+        const again = taken.map((_, i) => i).filter(i => rows[i] && !results[i].ok && results[i].error !== 'stopped');
+        if (!again.length || stopNow()) break;
+        log(`Retrying ${again.length} task(s) that did not start/finish (round ${round}/${FINISH_RETRIES})...`);
+        await sleep(10000);
+        let now;
+        try {   // all statuses: a task that did finish must be told apart from one that is gone
+          now = await timed('list query', () => ct.openChildren(code, ['Not yet Started', 'On-going', 'Finished']));
+        } catch (e) { log(`Could not re-read the task list: ${errText(e)}`); continue; }
+        await pool(again, async i => {
+          const r = now.find(x => x.reqCode === rows[i].reqCode);
+          if (!r) return fail(i, new Error(`${rows[i].reqCode} is no longer in the task list`));
+          rows[i] = r;
+          const wasDone = r.status == 4;   // read now: finish() sets it
+          try {
+            if (!wasDone) {
+              if (r.startDate == null) await ct.start(r);
+              await ct.finish(p, r);
+            } else if (r.systemID != '983') {
+              await ct.closeIssue(p, r);   // addEndDate went through, the Backlog close after it did not
+            }
+            results[i].ok = true; results[i].error = null;
+            log(`${tag(i)} finished (${r.reqCode})${wasDone ? ' - it had gone through' : ' on retry'}`);
+            progress(i, 'finished');
+          } catch (e) { fail(i, e); }
+        }, finishConcurrency);
+      }
+      mark('end');
+      const sec = (a, b) => ((phase[b] - phase[a]) / 1000).toFixed(1) + 's';
+      log(`Timing: checks ${sec('run', 'save')}, saving + lookup ${sec('save', 'finish')}, `
+        + `start/finish ${sec('finish', 'end')} (${finishConcurrency} at a time)`);
+      log('Requests: ' + Object.entries(times)
+        .map(([k, [n, ms]]) => `${k} ${n}x avg ${(ms / n / 1000).toFixed(2)}s`).join(', '));
       if (stopped) {
         const notDone = results.filter(r => r.error === 'stopped').length;
         log(`Stopped. ${notDone} task(s) not done - run the same list again to continue (finished ones are skipped).`);
