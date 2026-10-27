@@ -3,7 +3,8 @@
 // every request so a slow server only makes it slower, not broken.
 // Shared by the bookmarklet panel (ct-panel.js) and child_tasks.py.
 (() => {
-  if (window.__ct) return;
+  // Always (re)install: the site is a single-page app, so a core from an older
+  // bookmarklet stays loaded until a full reload and would shadow this one.
   const BACKLOG = 'https://hrd-s.backlog.com/api/v2';
   // One at a time: the server numbers a new child task as "highest code + 1", so
   // parallel saves get the SAME code (seen 2026-10-07: 504-740 and 504-744 x3).
@@ -78,11 +79,27 @@
       await until(() => vm.overlay === false, 180000, 'the task list to reload');
     },
     // Unfinished child tasks of `code`, straight from the API (no page reload).
-    // Rows are shaped like the page's own requestList rows, which Start/End send back.
+    // The whole task list (main + child rows) from the server, every page of it.
+    // The server pages it ({data, total, totalPages}, 20 rows by default); 1000 per page
+    // fails (SQL Server's 2100-parameter limit), 500 is safe.
+    async fetchTaskList(statuses) {
+      const vm = ct.vm();
+      const get = page => retry(() => axios.post('api/getProgrammerTaskList',
+        { programmer: vm.userInforDev.employeeID, status: statuses, page, perPage: 500 })).then(r => {
+        // Anything but a page is an error page: fail rather than read it as "no tasks",
+        // which would re-add finished ones.
+        if (!r.data || !Array.isArray(r.data.data))
+          throw new Error(`getProgrammerTaskList replied ${JSON.stringify(r.data).slice(0, 300)}`);
+        return r.data;
+      });
+      const first = await get(1);
+      const rest = await Promise.all(Array.from({ length: Math.max(0, first.totalPages - 1) }, (_, k) => get(k + 2)));
+      return [first, ...rest].flatMap(d => d.data);
+    },
+    // Rows are the page's own requestList rows, which Start/End send back.
     async openChildren(code, statuses) {
       const vm = ct.vm();
-      const raw = (await retry(() => axios.post('api/getProgrammerTaskList',
-        { programmer: vm.userInforDev.employeeID, status: statuses }))).data;
+      const raw = await ct.fetchTaskList(statuses);
       const sample = vm.requestList[0];
       const keys = sample ? Object.keys(sample).filter(k => k !== 'process') : null;
       const groups = {};
@@ -100,16 +117,17 @@
         return row;
       });
     },
-    mainTasks() {
-      return ct.vm().requestList
-        .filter(r => r.isChild != 1 && (r.status == 1 || r.status == 5))
+    async mainTasks() {
+      const raw = await ct.fetchTaskList(['Not yet Started', 'On-going']);
+      return raw.filter(r => r.isChild != 1 && (r.status == 1 || r.status == 5))
         .map(r => ({ code: r.reqCode, details: r.details, status: r.statusName, ongoing: r.status == 1 }));
     },
 
     // Everything saveChildTask looks up, fetched once per run.
     async prepare(code) {
       const vm = ct.vm(), user = vm.userInforDev;
-      const main = vm.requestList.find(r => r.reqCode === code && r.isChild != 1);
+      const raw = await ct.fetchTaskList(['Not yet Started', 'On-going']);
+      const main = raw.find(r => r.reqCode === code && r.isChild != 1);
       if (!main) throw new Error(`main task ${code} not found`);
       const systems = (await retry(() => axios.get('api/getSystemList'))).data;
       const sys = systems.find(s => s.id == main.systemID);

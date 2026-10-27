@@ -153,7 +153,7 @@
   const loadMains = async () => {
     try {
       await window.__ct.reload();
-      const mains = window.__ct.mainTasks();
+      const mains = await window.__ct.mainTasks();
       mainSel.innerHTML = mains.length
         ? mains.map(m => `<option value="${m.ongoing ? esc(m.code) : ''}" ${m.ongoing ? '' : 'disabled'}>`
             + `${esc(m.code)} [${esc(m.status)}] ${esc(m.details.slice(0, 45))}</option>`).join('')
